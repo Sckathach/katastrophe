@@ -1,0 +1,17 @@
+# Starship config for the sandbox guest.
+#
+# The prompt is tagged [vm] in bold yellow, deliberately: when you have host
+# shells and guest shells side by side, the badge is the only thing that tells
+# you which side of the boundary a command is about to run on. Getting that
+# wrong is how you `rm -rf` the wrong tree.
+#
+# (This file used to say [container] in cyan — it was the deleted GPU
+# container's config, and it came along when configs/ moved under guest/. The
+# VM's own config lived in the deleted nixos/ tree. So the VM wore the dead
+# runtime's badge for a while.)
+add_newline = false
+format = "[\\[vm\\]](bold yellow) $directory$git_branch$git_status$character"
+
+[character]
+success_symbol = "[>](bold green)"
+error_symbol = "[>](bold red)"

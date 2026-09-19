@@ -1,0 +1,49 @@
+# agent_sandbox.nft — session egress gate for the sandbox VM.
+#
+# Loaded by net-up.sh, removed by net-down.sh. One table now: the VM arrives on
+# the host via the bridge, so everything is expressed as `iifname virbr-agent`.
+#
+# (Until 2026-08 there was a second table, `agent_uid_egress`, gating a rootless
+# podman GPU container whose host sockets carried skuid=1001. That runtime is
+# gone — the GPU is passed into the VM via VFIO instead — so the table went with
+# it. The persistent `agent_isolate` skuid drop stays, and now with NO
+# exceptions punched into it: see net-up.sh for why that is a tightening.)
+#
+# !! THIS FILE IS NOT THE WHOLE POLICY. The per-port accepts are NOT here:
+# net-up.sh inserts them into `agent_vm input` and into the host's own
+# `filter input` from $SANDBOX_HOST_PORTS in config.sh, so the port list lives
+# in exactly one place. Today that is:
+#   :8080 — mitmproxy. ALL egress, including LLM API calls: the addon swaps
+#           the guest's sentinel credential for the real upstream key.
+#           (:4000/litellm used to sit beside it; deleted 2026-09-11.)
+#   :9418 — git daemon. Project ingress/egress (scripts/git-serve.sh).
+#   :8131 — searxng. Local metasearch (scripts/web.sh).
+# `kata status --rules` prints the effective ruleset — trust that, not this file.
+#
+# The inserted accepts land at the TOP of the chain (nft insert prepends),
+# ahead of the established/lo rules below. Semantically identical: the terminal
+# drop stays last, and nothing above it is a drop.
+
+table inet agent_vm {
+    chain input {
+        type filter hook input priority 0; policy accept;
+        # Return traffic for host-initiated connections (e.g. `kata vm --ssh`,
+        # host→VM:22). NEW from the VM is still dropped below, except the
+        # $SANDBOX_HOST_PORTS accepts, so this does NOT widen egress — it only
+        # lets back replies the host asked for. Mirrors `forward` below.
+        iifname "virbr-agent" ct state { established, related } accept
+        iifname "virbr-agent" udp dport 67 accept
+        # (per-port accepts inserted here by net-up.sh from $SANDBOX_HOST_PORTS)
+        iifname "virbr-agent" ip protocol icmp accept
+        iifname "virbr-agent" drop
+    }
+
+    chain forward {
+        # policy drop: the VM is never routed straight to the internet. Its only
+        # egress is TCP to the host services (handled in `input` above), so a
+        # guest crafting UDP/53 to a public resolver — or any other direct flow
+        # — is never forwarded. This is what closes DNS exfil.
+        type filter hook forward priority 0; policy drop;
+        oifname "virbr-agent" ct state { established, related } accept
+    }
+}

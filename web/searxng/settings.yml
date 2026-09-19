@@ -1,0 +1,33 @@
+# searxng settings for the sandbox instance. Committed — contains NO secret.
+#
+# `use_default_settings: true` means this file is a *diff* against the image's
+# own searx/settings.yml; only the keys below are overridden. Everything else
+# (the engine list, timeouts, ui) stays at upstream defaults, so an image bump
+# doesn't silently drop engines.
+#
+# server.secret_key is NOT set here: scripts/web.sh generates a per-deployment
+# secret into $SEARXNG_ETC_DIR/secret_key (0600, root) and injects it as
+# $SEARXNG_SECRET, which searxng's settings loader overlays onto this file.
+# searxng refuses to start (sys.exit(1)) if the key is still the placeholder.
+
+use_default_settings: true
+
+search:
+  # THE reason this file exists. Upstream ships `formats: [html]`, so
+  # /search?format=json returns 403 and `enap search` gets nothing. enap talks
+  # only JSON; html stays enabled so the UI is usable for debugging by hand.
+  formats:
+    - html
+    - json
+
+server:
+  # Pinned rather than inherited. The limiter is bot protection for public
+  # instances; here the only client is the agent, and being rate-limited on our
+  # own queries is a silent-degradation failure mode. It also keeps this a
+  # single container (the limiter wants valkey/redis).
+  limiter: false
+  # Public-instance hardening (also implies the limiter) — not a public instance.
+  public_instance: false
+  # Proxying images through searxng would make it fetch attacker-chosen URLs
+  # with searxng's network position: the confused-deputy shape we are avoiding.
+  image_proxy: false

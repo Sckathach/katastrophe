@@ -1,0 +1,22 @@
+[Unit]
+Description=katastrophe agent_isolate — persistent skuid egress drop
+Documentation=https://github.com/Sckathach/katastrophe
+# Deliberately independent of nftables.service: this loads exactly one table,
+# in the `inet` family, so it coexists with whatever else filters (ufw uses
+# iptables-nft => `ip`/`ip6` family tables; no overlap). Ordered after ufw so
+# that if ufw ever flushes on start it cannot take this table with it.
+After=ufw.service nftables.service firewalld.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+# The table must survive the unit "finishing" — it is a fail-safe, not a daemon.
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f /etc/nftables.d/agent_isolate.nft
+ExecReload=/usr/bin/nft -f /etc/nftables.d/agent_isolate.nft
+# No ExecStop, on purpose: `systemctl stop` must not silently disarm the
+# sandbox's outermost containment rule. To remove it deliberately:
+#     sudo nft destroy table inet agent_isolate
+
+[Install]
+WantedBy=multi-user.target

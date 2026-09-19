@@ -1,0 +1,67 @@
+# agent_isolate.nft — persistent skuid-based egress drop for the agent uid.
+#
+# Load-bearing outermost rule of the sandbox. MUST persist across reboots,
+# independent of any of the scripts in this repo. Install:
+#
+#     sudo cp nft/agent_isolate.nft      /etc/nftables.d/
+#     sudo cp nft/agent-isolate.service  /etc/systemd/system/
+#     sudo systemctl enable --now agent-isolate.service
+#
+# NOTE: a dedicated unit, NOT `systemctl enable nftables`. nftables.service
+# applies the whole of /etc/nftables.conf, which on a typical distro also
+# declares `table inet filter { policy drop }`. If something else is already
+# filtering (ufw, firewalld), you end up with two independent rulesets on the
+# same hook, and since `drop` is terminal across chains the effective policy
+# becomes their intersection — a good way to lose sshd or tailscale. This
+# table is in the `inet` family and every rule is qualified `meta skuid`, so
+# on its own it cannot collide with anything or affect a non-agent process.
+#
+# This table sits at priority -10, i.e. before `inet filter`. Only `drop` is
+# terminal across chains — an `accept` here just exits this chain, so later
+# chains at the same hook still apply.
+#
+# NOTHING punches exceptions into this table any more. Until 2026-08 net-up.sh
+# inserted one `skuid AGENT_UID -> HOST_IP:<port> accept` per SANDBOX_HOST_PORTS
+# entry, because the rootless GPU container's host sockets carried skuid 1001
+# and 10.201.0.1 is inside the 10/8 drop below. That runtime is gone. The VM's
+# traffic arrives over the bridge carrying no skuid, and qemu (which runs as
+# AGENT_UID after `-run-with user=`) opens no TCP of its own — so the drop is
+# now unconditional, and an escaped qemu can reach none of mitmproxy, the git
+# daemon, or searxng. That is a tightening; don't undo it casually.
+
+# Idempotency: plain `nft -f` on a file declaring an existing table APPENDS its
+# rules, so a second load would leave two copies of every drop. `destroy` (nft
+# >= 1.0.6, kernel >= 6.3) removes it if present and is a no-op if not, unlike
+# `delete` which errors.
+destroy table inet agent_isolate
+
+table inet agent_isolate {
+    chain output {
+        type filter hook output priority -10; policy accept;
+
+        # Allow loopback and established. (Established won't bypass anything
+        # below since the drops fire on `new` packets first; this just covers
+        # 127.0.0.1 services and reply traffic for already-allowed flows.)
+        meta skuid 1001 oifname "lo" accept
+        meta skuid 1001 ct state established,related accept
+
+        # RFC1918 + tailscale CGNAT + link-local + multicast (v4).
+        meta skuid 1001 ip daddr {
+            10.0.0.0/8,
+            172.16.0.0/12,
+            192.168.0.0/16,
+            100.64.0.0/10,
+            169.254.0.0/16,
+            224.0.0.0/4
+        } log prefix "agent-isolate-drop: " drop
+
+        # tailscale ULA + link-local + multicast (v6).
+        # The first prefix is tailscale's specific ULA; replace with fc00::/7
+        # to block all ULAs.
+        meta skuid 1001 ip6 daddr {
+            fd7a:115c:a1e0::/48,
+            fe80::/10,
+            ff00::/8
+        } log prefix "agent-isolate-drop6: " drop
+    }
+}

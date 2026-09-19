@@ -1,0 +1,52 @@
+# Agent VM user zshrc. Copied onto the storage tree by `kata disk seed` (NOT
+# baked into the image — /home/agent is a virtiofs mountpoint at session time),
+# so it is writable and persists across sessions. Tweak it in the guest, or here
+# and re-seed with `kata disk seed --force`; if both moved, merge by hand.
+# System-wide /etc/zsh/zshrc (guest/cloud-init/user-data) already loads compinit,
+# fzf-tab, fzf widgets, zoxide, autosuggestions, syntax highlighting and
+# starship, in that order. This file is for per-user opts/aliases/binds.
+
+# --- fzf-tab previews (eza/bat are in systemPackages) -----------------------
+zstyle ':completion:*' menu no
+zstyle ':fzf-tab:*' fzf-flags --height=50% --layout=reverse
+zstyle ':fzf-tab:complete:cd:*' fzf-preview 'eza -1 --color=always $realpath'
+zstyle ':fzf-tab:complete:*:*' fzf-preview \
+  'bat --color=always --style=numbers --line-range=:500 ${(Q)realpath} 2>/dev/null \
+   || eza -1 --color=always $realpath'
+
+# --- fzf behaviour ----------------------------------------------------------
+export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+export FZF_ALT_C_COMMAND='fd --type d --hidden --exclude .git'
+export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border
+  --bind "ctrl-/:toggle-preview"
+  --bind "ctrl-d:preview-down,ctrl-u:preview-up"
+  --bind "ctrl-a:select-all"'
+export FZF_CTRL_T_OPTS='--preview "bat --color=always --style=numbers --line-range=:500 {}"
+  --preview-window=right:50%:wrap'
+
+# --- aliases ----------------------------------------------------------------
+alias ls='eza'
+alias ll='eza -lah --git'
+alias lt='eza --tree --level=2'
+alias cat='bat -pp'
+export EDITOR=nvim VISUAL=nvim
+
+# --- binds (emacs keymap) ---------------------------------------------------
+# Ctrl-L/Ctrl-H move word-wise (handy with autosuggestions). NB: this drops
+# the default Ctrl-L clear-screen — comment these two out to get it back.
+bindkey '^L' forward-word
+bindkey '^H' backward-word
+
+# --- login banner -----------------------------------------------------------
+# Once per login shell (serial autologin + ssh), not in every subshell. Print
+# the KATASTROPHE wordmark, then fastfetch (cat logo + specs). `command cat`
+# bypasses the cat=bat alias above, which would otherwise mangle the raw ANSI.
+if [[ -o login ]]; then
+  [[ -r ~/.config/fastfetch/word.txt ]] && command cat ~/.config/fastfetch/word.txt
+  command -v fastfetch >/dev/null && fastfetch
+fi
+
+# --- fzf helpers ------------------------------------------------------------
+fkill() { local p; p=$(ps -ef | sed 1d | fzf --header='kill process' | awk '{print $2}'); [[ -n "$p" ]] && kill -9 "$p"; }
+fbranch() { local b; b=$(git branch --all | fzf | tr -d '[:space:]'); [[ -n "$b" ]] && git checkout "$b"; }

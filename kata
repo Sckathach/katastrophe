@@ -1,0 +1,580 @@
+#!/usr/bin/env bash
+# kata — the one entry point. Dispatches to scripts/, plus three read-only
+# built-ins (bases, status, doctor).
+#
+# This was ~2,250 lines of Rust until 2026-09-08. What it did was: parse args,
+# decide which subcommands need root, exec a bash script, and render three
+# read-only reports — and its config loader shelled out to bash to source
+# config.sh, which is the tell. The Rust bought a nice --help and cost a
+# `cargo install` step between editing a script and running it; half a debugging
+# session once went into "I already fixed that" versus a binary from two hours
+# earlier. There is no build step now: this file IS what runs.
+#
+# INSTALL: symlink it onto your PATH, e.g.
+#     ln -sfn "$PWD/kata" ~/.local/bin/kata
+# REPO_ROOT resolves through that symlink (realpath below), so moving the
+# checkout never breaks it — which the Rust `find_root()` walk-up did, because
+# it searched upward from $PWD and from ~/.cargo/bin and found neither.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")" && pwd)"
+export REPO_ROOT
+
+# --- output ---------------------------------------------------------------
+# Same four tags the Rust ui.rs used, so existing output reads the same.
+if [[ -t 1 ]]; then
+  _C_OK=$'\033[32m' _C_WARN=$'\033[33m' _C_ERR=$'\033[31m' _C_INFO=$'\033[36m'
+  _C_DIM=$'\033[2m' _C_OFF=$'\033[0m'
+else
+  _C_OK="" _C_WARN="" _C_ERR="" _C_INFO="" _C_DIM="" _C_OFF=""
+fi
+ok() { printf '%s[ok]%s %s\n' "$_C_OK" "$_C_OFF" "$*"; }
+warn() { printf '%s[--]%s %s\n' "$_C_WARN" "$_C_OFF" "$*"; }
+err() { printf '%s[!!]%s %s\n' "$_C_ERR" "$_C_OFF" "$*"; }
+info() { printf '%s[..]%s %s\n' "$_C_INFO" "$_C_OFF" "$*"; }
+die() {
+  err "$*"
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+kata — a local sandbox for running untrusted code (LLM agents, PyPI packages,
+model weights) in a throwaway qemu/KVM VM behind a TLS-terminating egress gate.
+
+  kata up [--profile NAME]   bridge + nft gate + mitmproxy      (once per boot)
+                             NAME is the egress policy: swe (default) | research
+                             (+ HF/CUDA/pytorch) | local (apt only — host-side
+                             llama.cpp/searxng are reached past the gate).
+                             Inspect: python3 proxy/mitmproxy/allowlist.py
+  kata down                  tear it all back down (agent_isolate stays)
+  kata status [--rules]      is it working right now?  (never prompts for sudo;
+                             --rules also dumps the effective nft chains, which
+                             DO need root — the .nft template is not the policy)
+  kata doctor [--gpu]        can this machine do it?   (may prompt)
+  kata test                  run the test suites (the launch guards need root,
+                             and skip politely without it)
+
+  kata vm [opts]             boot the sandbox   ('kata vm -- --help' for flags)
+  kata ssh [cmd]             shell into the running session (any number)
+  kata bases                 warm base images: version, size, lineage
+  kata build-base [-- --cuda]  build the blank guest image
+
+  kata project {add|push|pull|list}    git interchange with the agent
+  kata git {up|down|status}            git daemon on the bridge
+  kata web {up|down|status}            local searxng
+  kata disk {...}                      storage helper ('kata disk --help')
+  kata gpu-mode {status|host|sandbox}  which side owns the dGPU (needs reboot)
+
+Never prefix with sudo: kata elevates the subcommands that need root by itself,
+and refuses the ones that must stay unprivileged.
+EOF
+}
+
+# There are NO global flags. There was one, `--usb`, which selected between two
+# whole storage trees and had to be threaded into every script's environment for
+# the two halves of a workflow to agree about where storage was. Deleted
+# 2026-09-13 along with the mode: there is one agent home, named once in
+# config.local.sh, and `kata vm --home PATH` overrides it for a single run. If you
+# are tempted to add a global flag, check first whether it is really a config
+# value that only looks like a flag because it used to have two possible answers.
+[[ $# -gt 0 ]] || {
+  usage
+  exit 0
+}
+CMD="$1"
+shift
+
+case "$CMD" in
+-h | --help | help)
+  usage
+  exit 0
+  ;;
+esac
+
+# `kata vm -- --help` — the usage text advertises `--` as "everything after this
+# is the script's", so consume it here instead of passing it down for the script
+# to reject as an unknown arg (which is what it did until 2026-09-13).
+if [[ "${1:-}" == "--" ]]; then shift; fi
+
+# --- privilege ------------------------------------------------------------
+# Declared once here and consumed by the dispatch below. Do NOT re-derive a sudo
+# decision per subcommand — that is what this table replaced.
+#
+#   root  the CLI wraps the script in sudo itself
+#   user  REFUSES to run as root, because running it privileged is a bug:
+#         git/project must own the repos they write, build-base would leave a
+#         root-owned guest/build that breaks the next non-root build, and ssh as
+#         root would use root's ~/.ssh and known_hosts.
+#   any   read-only enough to work either way
+#
+# The scripts assert the same thing themselves ([[ $EUID -ne 0 ]] || die). This
+# table is the good error message; the script check is the actual guarantee.
+
+# First non-flag word of a pass-through arg list, i.e. the script's own
+# subcommand. Matching $1 blindly would misclassify `kata web --quiet up`.
+subcmd_of() {
+  local a
+  for a in "$@"; do
+    case "$a" in -*) ;; *)
+      echo "$a"
+      return 0
+      ;;
+    esac
+  done
+  return 0
+}
+
+privilege() { # -> root | user | any
+  local sub
+  sub="$(subcmd_of "$@")"
+  case "$CMD" in
+  up | down | disk) echo root ;;
+  # Launching and stopping need root (qemu, /run, the bridge tap). --status only
+  # reads the world-readable state file, and asking for a password to answer "is
+  # the VM up" trains you to type it.
+  vm)
+    case " $* " in
+    *" --status "* | *" --help "* | *" -h "*) echo any ;;
+    *) echo root ;;
+    esac
+    ;;
+  ssh | git | project | build-base) echo user ;;
+  # `test` is 'any': unprivileged it skips the root-only suites, and under
+  # sudo it runs them. Both are useful, so neither is refused.
+  test) echo any ;;
+  gpu-mode)
+    # vbios reads the PCI ROM BAR, which is root-only. status stays
+    # unprivileged: asking for a password to answer "who owns the card" is the
+    # habit that makes you type it without reading.
+    case "$sub" in host | sandbox | vbios) echo root ;; *) echo any ;; esac
+    ;;
+  web)
+    case "$sub" in up | down) echo root ;; *) echo any ;; esac
+    ;;
+  *) echo any ;;
+  esac
+}
+
+PRIV="$(privilege "$@")"
+if [[ $EUID -eq 0 && "$PRIV" == user ]]; then
+  die "don't run 'kata ${CMD}' as root — drop the sudo.
+     kata elevates the subcommands that need root by itself. (If you got here
+     via 'sudo kata', note that ~/.local/bin is not on root's secure_path, so
+     that usually fails with 'command not found' instead — also correct.)"
+fi
+
+# Run a script from scripts/, inheriting stdio.
+#
+# Nothing is passed through the environment any more. When it was (KATA_STORAGE),
+# the form was `sudo env VAR=… script` — NOT `sudo -E` and NOT `sudo VAR=val`,
+# both of which depend on the host's sudoers `setenv` policy and so work on your
+# machine and not on someone else's. `env` is just a binary the elevated shell
+# execs, so no policy is involved. Keep that shape if you ever need it again:
+# sudo's env_reset silently drops anything you merely export, which is the same
+# failure that made shell-exported API keys never reach the proxy.
+run_script() {
+  local script="$1"
+  shift
+  local path="${REPO_ROOT}/scripts/${script}"
+  [[ -x "$path" ]] || die "missing script: ${path}"
+  if [[ "$PRIV" == root && $EUID -ne 0 ]]; then
+    exec sudo "$path" "$@"
+  fi
+  exec "$path" "$@"
+}
+
+case "$CMD" in
+up) run_script net-up.sh "$@" ;;
+down) run_script net-down.sh "$@" ;;
+vm) run_script vm.sh "$@" ;;
+ssh) run_script ssh.sh "$@" ;;
+gpu-mode) run_script gpu-mode.sh "$@" ;;
+project) run_script project.sh "$@" ;;
+git) run_script git-serve.sh "$@" ;;
+web) run_script web.sh "$@" ;;
+disk) run_script disk.sh "$@" ;;
+build-base) run_script build-base.sh "$@" ;;
+test)
+  exec "${REPO_ROOT}/tests/run.sh" "$@"
+  ;;
+bases | status | doctor) ;; # built-ins, below
+*)
+  err "unknown subcommand: ${CMD}"
+  echo
+  usage
+  exit 1
+  ;;
+esac
+
+# Built-ins need the config; the pass-throughs above exec'd before this line, so
+# nothing else pays for sourcing it.
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/config.sh"
+
+# --- shared probes --------------------------------------------------------
+# listens(), proxy_state(), proxy_profile() and state_field() live in scripts/lib.sh — they are
+# shared with vm.sh, which needs the same egress proof at launch that status
+# reports. They work UNPRIVILEGED, which is the design rule for `kata status`
+# and why the old dashboard's sudo problem does not exist any more: it read nft
+# tables and `podman ps` through `sudo -n`, which needs a cached sudo timestamp
+# that a hardened sudoers (timestamp_timeout=0) never grants, so every
+# privileged row rendered red on a perfectly healthy host. The fix was not more
+# sudo; it was noticing that a FUNCTIONAL check proves more than a privileged
+# read, and needs no privilege to do it.
+
+# LC_ALL=C or a French locale renders 3.1G as "3,1G", which reads as a
+# thousands separator in a size column.
+human_size() { LC_ALL=C numfmt --to=iec --format='%.1f' "${1:-0}" 2>/dev/null || echo "?"; }
+
+# --- kata status ----------------------------------------------------------
+# "Is it working right now." Runs constantly, so it must be fast and must never
+# prompt. Anything it cannot see without root is reported as unknown, not as
+# broken — `kata doctor` is the one allowed to ask for a password.
+cmd_status() {
+  local pad=9 rules=false
+  [[ "${1:-}" == "--rules" ]] && rules=true
+
+  printf "%-${pad}s %s\n" "home" "${MOUNT_HOME}"
+  if [[ -d "$MOUNT_HOME" ]]; then
+    printf "%-${pad}s %s\n" "" "$(df -h --output=avail "$MOUNT_HOME" 2>/dev/null | tail -1 | tr -d ' ') free, owner $(stat -c %U "$MOUNT_HOME" 2>/dev/null)"
+  else
+    warn "agent home missing: ${MOUNT_HOME}  (kata disk mount, or kata disk local-init)"
+  fi
+
+  if ip link show "$BRIDGE" &>/dev/null; then
+    ok "bridge    ${BRIDGE} ${HOST_IP}/${PREFIX}"
+  else
+    err "bridge    ${BRIDGE} down — run: kata up"
+  fi
+
+  local pstate profile
+  pstate="$(proxy_state)"
+  case "$pstate" in
+  ok)
+    # The profile comes out of the gate's own 403, not out of config.sh: if you
+    # changed ALLOWLIST_PROFILE and did not re-run `kata up`, this row is the
+    # only thing that will tell you. A mismatch with config is not an error
+    # (a per-run `--profile` is legitimate), so it is reported, not judged.
+    profile="$(proxy_profile)"
+    if [[ -n "$profile" && "$profile" != "$ALLOWLIST_PROFILE" ]]; then
+      ok "egress    mitmproxy ${HOST_IP}:${PROXY_PORT} — gate live, profile=${profile} (config says ${ALLOWLIST_PROFILE})"
+    else
+      ok "egress    mitmproxy ${HOST_IP}:${PROXY_PORT} — denied a test host (gate live, profile=${profile:-?})"
+    fi
+    ;;
+  wedged) err "egress    mitmproxy ${HOST_IP}:${PROXY_PORT} — socket accepts, no response. Wedged: kata down && kata up" ;;
+  down) err "egress    mitmproxy ${HOST_IP}:${PROXY_PORT} — nothing listening. Run: kata up" ;;
+  *) warn "egress    mitmproxy answered ${pstate}, expected 403 — is the addon loaded?" ;;
+  esac
+
+  # Optional services: absent is a normal state, not a failure.
+  if listens "$HOST_IP" "$GIT_PORT"; then
+    ok "git       daemon ${HOST_IP}:${GIT_PORT}"
+  else
+    warn "git       no daemon on ${HOST_IP}:${GIT_PORT} — kata git up"
+  fi
+  if listens "$HOST_IP" "$SEARXNG_PORT"; then
+    ok "search    searxng ${HOST_IP}:${SEARXNG_PORT}"
+  else
+    warn "search    searxng not running — kata web up"
+  fi
+
+  # agent_isolate is the one thing no unprivileged check can prove: it drops
+  # skuid=$AGENT_UID → RFC1918, and exercising it means becoming that uid, which
+  # needs root. Try a non-prompting read; if sudo declines, say UNKNOWN rather
+  # than red, and point at the command that can actually answer.
+  if sudo -n nft list table inet agent_isolate &>/dev/null; then
+    ok "nft       agent_isolate loaded (persistent skuid drop)"
+  elif sudo -n true &>/dev/null; then
+    err "nft       agent_isolate NOT loaded — the persistent egress drop is missing"
+  else
+    printf "%-${pad}s %s\n" "nft" "agent_isolate unknown (needs sudo) — kata doctor"
+  fi
+
+  local pid
+  if pid="$(session_pid)"; then
+    local gpu to
+    gpu="$(state_field gpu)" to="$(state_field to)"
+    ok "vm        $(state_field session) — base=$(state_field base) gpu=${gpu} mem=$(state_field mem)${to:+ →bake ${to}}"
+    printf "%-${pad}s %s\n" "" "qemu pid ${pid} · connect: kata ssh · stop: kata vm --stop"
+  else
+    printf "%-${pad}s %s\n" "vm" "no session running  (kata vm --ssh)"
+  fi
+
+  # nft/agent_sandbox.nft stopped being readable as the whole policy when the
+  # per-port accepts moved into $SANDBOX_HOST_PORTS: net-up.sh INSERTS them at
+  # up time, so the template on disk and the rules in the kernel are different
+  # documents. Print what the kernel actually holds rather than trusting the
+  # file. Needs root, so it is opt-in and separate from the status rows.
+  if [[ "$rules" == true ]]; then
+    echo
+    echo "effective rules (ports: ${SANDBOX_HOST_PORTS}):"
+    # NB: the split target must NOT be the loop variable — `read -r t c <<<"$t"`
+    # clobbers it mid-iteration and silently drops entries from the list.
+    local pair table chain
+    for pair in "agent_vm input" "agent_vm forward" "agent_isolate output" "filter input"; do
+      read -r table chain <<<"$pair"
+      echo
+      echo "--- inet ${table} ${chain} ---"
+      sudo nft list chain inet "$table" "$chain" 2>/dev/null || warn "not loaded, or sudo declined"
+    done
+  fi
+}
+
+# --- kata bases -----------------------------------------------------------
+# The inventory, with the two things a bare `ls` cannot tell you: which base each
+# warm one was baked from, and whether that parent has moved on since.
+#
+# The second is the whole point. A `cuda` image that looks fine is worthless if
+# it was baked off a blank base you have since rebuilt, and the only symptom is
+# that things you know you installed are missing from the guest — which reads as
+# three separate guest bugs for as long as you let it.
+cmd_bases() {
+  echo "bases in ${VM_BASES_DIR}"
+  [[ -d "$VM_BASES_DIR" ]] || {
+    warn "${VM_BASES_DIR} missing — nothing built yet (kata build-base)"
+    return 0
+  }
+  shopt -s nullglob
+  local imgs=("$VM_BASES_DIR"/*.qcow2)
+  shopt -u nullglob
+  ((${#imgs[@]})) || {
+    info "no bases in ${VM_BASES_DIR}"
+    echo "  build the blank one: kata build-base"
+    return 0
+  }
+
+  # Current version of every base first, so a child can be compared to its
+  # parent. The parent version recorded in a sidecar is a snapshot taken at bake
+  # time and stays true after the parent moves on — that difference is exactly
+  # what makes STALE detectable.
+  declare -A cur=()
+  local img name
+  for img in "${imgs[@]}"; do
+    name="$(basename "$img" .qcow2)"
+    cur["$name"]="$(base_version "$name")"
+  done
+
+  local stale=0 drift=0 host_ca
+  host_ca="$(ca_fingerprint)"
+  echo
+  printf "  %-14s %4s  %7s  %-17s %s\n" NAME VER SIZE CREATED FROM
+  for img in "${imgs[@]}"; do
+    name="$(basename "$img" .qcow2)"
+    local meta="${VM_BASES_DIR}/${name}.json" ver created from
+    if [[ -r "$meta" ]] && command -v jq >/dev/null; then
+      ver="v$(jq -r '.version // "?"' "$meta")"
+      created="$(jq -r '.created // ""' "$meta" | tr T ' ' | cut -c1-16)"
+      local pn pv
+      pn="$(jq -r '.parent.name // empty' "$meta")"
+      pv="$(jq -r '.parent.version // empty' "$meta")"
+      if [[ -n "$pn" ]]; then
+        from="← ${pn} v${pv}"
+        # base_version() is 0 for a base with no sidecar, so this compares
+        # numbers unconditionally — an absent parent just never looks stale.
+        if [[ -n "${cur[$pn]:-}" ]] && ((cur[$pn] > pv)); then
+          from="${from}   ${_C_WARN}STALE: ${pn} is now v${cur[$pn]}${_C_OFF}"
+          stale=1
+        fi
+      elif [[ "$(jq -r '.origin // empty' "$meta")" == build ]]; then
+        from="built from the Ubuntu cloud image"
+      else
+        from="—"
+      fi
+      # CA drift. The image's trust store is baked in at build time, so a base
+      # that predates the CA now running fails EVERY TLS request in the guest —
+      # a symptom that names the proxy rather than the image. Empty on either
+      # side means unknown (base predates the field / host has no CA yet), never
+      # drift. `kata vm` refuses to boot a drifted base without --force.
+      local bca
+      bca="$(jq -r '.ca // ""' "$meta")"
+      if [[ -n "$bca" && -n "$host_ca" && "$bca" != "$host_ca" ]]; then
+        from="${from}   ${_C_ERR}CA DRIFT${_C_OFF}"
+        drift=1
+      fi
+    else
+      # Normal, never fatal: anything baked before versioning existed.
+      ver="?" created="—" from="unversioned (baked before metadata existed)"
+    fi
+    printf "  %-14s %4s  %7s  %-17s %s\n" \
+      "$name" "$ver" "$(human_size "$(stat -c %s "$img")")" "$created" "$from"
+  done
+
+  if ((stale)); then
+    echo
+    warn "a base is older than what it was built from — re-bake: kata vm --ssh --from <parent> --to <name>"
+  fi
+  if ((drift)); then
+    echo
+    err "a base trusts a CA this host no longer runs — TLS fails in the guest. Rebuild: kata build-base"
+  fi
+  # A running --to session has NOT written its base yet: the bake happens on
+  # clean poweroff. Without this line the listing shows the OLD image mid-flight,
+  # which reads as "--to was ignored" or "the base died".
+  local pid to
+  if pid="$(session_pid)"; then
+    to="$(state_field to)"
+    if [[ -n "$to" ]]; then
+      echo
+      info "a session is running with --to ${to}: the row above is still the OLD ${to}. The bake happens on clean poweroff."
+    fi
+  fi
+}
+
+# --- kata doctor ----------------------------------------------------------
+# "Can this machine do it." Run once per machine, so unlike `status` it is
+# allowed to prompt for a password. Exit code is the number of HARD failures.
+DOCTOR_FAILS=0
+need() { # $1=binary $2=install hint
+  local p
+  if p="$(command -v "$1" 2>/dev/null)"; then
+    ok "$1 (${p})"
+  else
+    err "$1 not found — install $2"
+    DOCTOR_FAILS=$((DOCTOR_FAILS + 1))
+  fi
+}
+want() { # soft version of need()
+  local p
+  if p="$(command -v "$1" 2>/dev/null)"; then ok "$1 (${p})"; else warn "$1 not found — $2"; fi
+}
+hard() { # $1=0|1 pass $2=msg-ok ("" = already reported, print nothing) $3=msg-fail
+  if (($1)); then
+    if [[ -n "$2" ]]; then ok "$2"; fi
+  else
+    err "$3"
+    DOCTOR_FAILS=$((DOCTOR_FAILS + 1))
+  fi
+}
+
+cmd_doctor() {
+  local gpu=false
+  [[ "${1:-}" == "--gpu" ]] && gpu=true
+
+  echo "runtime (qemu/KVM VM on the host bridge):"
+  if [[ -w /dev/kvm ]]; then
+    ok "/dev/kvm accessible"
+  elif [[ -e /dev/kvm ]]; then
+    hard 0 "" "/dev/kvm present but not writable (add yourself to the 'kvm' group)"
+  else
+    hard 0 "" "/dev/kvm missing (enable VT-x/AMD-V in firmware, load the kvm module)"
+  fi
+  need qemu-system-x86_64 "qemu / qemu-system-x86 / qemu-kvm"
+  need qemu-img "qemu-img / qemu-utils"
+  need nft nftables
+  need podman "podman (runs the mitmproxy container)"
+  need git "git (project interchange + git daemon)"
+  need jq "jq (base metadata, session state)"
+
+  # virtiofsd's location varies: Arch ships it at /usr/lib, Debian/Fedora at
+  # /usr/libexec. vm.sh searches the same three places.
+  local v found=0
+  for v in /usr/lib/virtiofsd /usr/libexec/virtiofsd "$(command -v virtiofsd 2>/dev/null || true)"; do
+    if [[ -n "$v" && -x "$v" ]]; then
+      ok "virtiofsd (${v})"
+      found=1
+      break
+    fi
+  done
+  hard "$found" "" "virtiofsd not found (looked in /usr/lib, /usr/libexec, PATH)"
+
+  local got
+  got="$(id -u "$AGENT_USER" 2>/dev/null || true)"
+  if [[ "$got" == "$AGENT_UID" ]]; then
+    ok "user '${AGENT_USER}' exists (uid ${got})"
+  elif [[ -n "$got" ]]; then
+    hard 0 "" "user '${AGENT_USER}' has uid ${got}, expected ${AGENT_UID} (set AGENT_UID, or recreate the user)"
+  else
+    hard 0 "" "user '${AGENT_USER}' missing — sudo useradd -u ${AGENT_UID} -m ${AGENT_USER}"
+  fi
+
+  # This one is allowed to prompt: it is the load-bearing persistent drop, and
+  # "unknown" is not a useful answer for a preflight.
+  #
+  # `sudo -n true` is the WRONG probe here and always will be. What we need to
+  # separate is "the table is not loaded" (a real, countable failure) from "sudo
+  # would not let me look" (unknowable, not a failure of the sandbox). nft's own
+  # "No such file or directory" means the former; only a `sudo:`-prefixed stderr
+  # means the latter. Getting this backwards reports a healthy host as broken.
+  local nfterr
+  if nfterr="$(sudo nft list table inet agent_isolate 2>&1 >/dev/null)"; then
+    ok "agent_isolate loaded (persistent skuid drop)"
+  elif [[ "${nfterr#"${nfterr%%[![:space:]]*}"}" == sudo:* ]]; then
+    warn "agent_isolate: could not verify (${nfterr##*sudo: }) — re-run in a terminal"
+  else
+    err "agent_isolate NOT loaded — install nft/agent_isolate.nft + nft/agent-isolate.service"
+    DOCTOR_FAILS=$((DOCTOR_FAILS + 1))
+  fi
+
+  if [[ -f "$PROXY_CA_CERT" ]]; then
+    ok "mitmproxy CA present (${PROXY_CA_CERT})"
+  else
+    warn "no mitmproxy CA at ${PROXY_CA_CERT} — run 'kata up' once to generate it"
+  fi
+
+  echo
+  echo "base image build (kata build-base):"
+  want curl "needed to fetch the Ubuntu cloud image"
+  local t iso=""
+  for t in cloud-localds xorriso genisoimage mkisofs; do
+    if command -v "$t" &>/dev/null; then
+      iso="$t"
+      break
+    fi
+  done
+  if [[ -n "$iso" ]]; then
+    ok "seed ISO packer: ${iso}"
+  else
+    warn "no seed ISO packer (install cloud-image-utils, or xorriso)"
+  fi
+
+  if [[ "$gpu" == true ]]; then
+    echo
+    echo "GPU passthrough (kata vm --gpu):"
+    local groups
+    groups="$(find /sys/kernel/iommu_groups -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)"
+    hard "$((groups > 0))" "IOMMU active (${groups} groups)" \
+      "no IOMMU groups — enable VT-d/AMD-Vi in firmware"
+
+    # Interrupt remapping is the SECURITY half. Without it VFIO only binds with
+    # allow_unsafe_interrupts=1, which lets the guest inject MSIs at the host —
+    # exactly the boundary this project exists to keep. Never add that flag to
+    # make things work.
+    local ecap ir=0
+    for ecap in /sys/class/iommu/*/intel-iommu/ecap; do
+      [[ -r "$ecap" ]] || continue
+      if (($((0x$(tr -d ' \n' <"$ecap"))) & 8)); then ir=1; fi
+    done
+    hard "$ir" "interrupt remapping supported (no allow_unsafe_interrupts needed)" \
+      "interrupt remapping not detected — refusing to recommend VFIO without it"
+
+    local m missing=()
+    for m in vfio vfio_pci vfio_iommu_type1; do
+      modinfo "$m" &>/dev/null || missing+=("$m")
+    done
+    hard "$((${#missing[@]} == 0))" "vfio modules available" \
+      "missing kernel modules: ${missing[*]-}"
+
+    # Soft: you can legitimately run doctor while the host owns the card.
+    if lspci -Dnk 2>/dev/null | grep -A3 -E '^[0-9a-f:.]+ 03(00|02): 10de:' | grep -q vfio-pci; then
+      ok "GPU bound to vfio-pci (sandbox mode)"
+    else
+      warn "GPU not on vfio-pci — 'kata gpu-mode sandbox' then reboot"
+    fi
+  fi
+
+  echo
+  if ((DOCTOR_FAILS == 0)); then
+    ok "all required checks passed"
+  else
+    err "${DOCTOR_FAILS} required check(s) failed"
+  fi
+  return "$DOCTOR_FAILS"
+}
+
+case "$CMD" in
+status) cmd_status "$@" ;;
+bases) cmd_bases ;;
+doctor) cmd_doctor "$@" ;;
+esac

@@ -1,0 +1,444 @@
+#cloud-config
+# Guest definition for the katastrophe sandbox VM. Ubuntu 24.04 LTS cloud image.
+#
+# Replaces the old nixos/{common,configuration}.nix pair. Consumed ONCE, by
+# scripts/build-base.sh, which boots the stock cloud image with a NoCloud seed
+# ISO, lets cloud-init provision, then powers off and keeps the resulting qcow2
+# as the blank base. Sessions boot that base with cloud-init disabled, so none
+# of this runs again at session time.
+#
+# Why Ubuntu and not NixOS: the ML/CUDA stack is NixOS's worst case (driver libs
+# in FHS paths, binary wheels), and the agents that run in here know `apt` and
+# `pip`, not `configuration.nix`. We were paying the Nix tax and then breaking
+# reproducibility with `uv` anyway.
+#
+# Double-at-delimited placeholders are substituted by build-base.sh. All except
+# the CA is injected base64-encoded (`encoding: b64`) — logo.ans is raw ANSI
+# with escape bytes, which cannot survive being pasted into YAML as text.
+#
+# MODULE ORDER MATTERS and is not obvious. In Ubuntu's cloud.cfg,
+# cloud_init_modules (write-files, ca-certs, users-groups, in that order) all
+# run BEFORE cloud_config_modules (apt-configure, packages) and before runcmd
+# (final stage). The consequence relied on below: ca-certs lands before apt
+# runs, so apt can use the TLS-terminating proxy.
+#
+# Nothing here writes under /home/agent. It is a virtiofs MOUNTPOINT at session
+# time (the persistent agent home), so image content there would be shadowed and
+# would drift from the real copy. Per-user dotfiles are seeded on the HOST, by
+# `kata disk seed`, from the same guest/configs/ tree. System-wide config
+# (/etc/zsh/zshrc, /etc/starship.toml, /etc/environment) stays here, because
+# that is on the image and survives the mount.
+
+hostname: agent-vm
+prefer_fqdn_over_hostname: false
+
+users:
+  - name: agent
+    uid: @@AGENT_UID@@
+    shell: /usr/bin/zsh
+    groups: [sudo]
+    lock_passwd: false
+    # Throwaway guest on an isolated bridge, reachable only from the host.
+    # Same value the old NixOS image used (initialPassword = "agent").
+    plain_text_passwd: agent
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+
+ssh_pwauth: true
+disable_root: true
+
+# --- CA trust ---------------------------------------------------------------
+# The host's mitmproxy TLS-terminates EVERY flow with the per-deployment CA, so
+# the only certificate this guest ever sees is signed by it.
+ca_certs:
+  trusted:
+    - |
+      @@MITM_CA@@
+
+# --- apt --------------------------------------------------------------------
+# NOTE: no proxy directive here, on purpose. The build boot runs on qemu SLIRP
+# with plain NAT — the host bridge does not exist yet and @@HOST_IP@@ is
+# unreachable, so a proxy set at this point would hang every apt call until it
+# times out. The sandbox's apt proxy is written at the END of runcmd, after all
+# provisioning traffic is done. Same reason the static bridge address is only
+# switched in at the end. Consequence worth keeping: `kata build-base` needs
+# neither `kata up` nor a live mitmproxy, and build-only hosts (nodesource,
+# starship.rs, astral.sh) never have to enter the runtime allowlist.
+apt:
+  sources:
+    nodesource:
+      # Node 22. Ubuntu 24.04 ships 18.19, older than what current agent CLIs
+      # test against.
+      source: "deb https://deb.nodesource.com/node_22.x nodistro main"
+      keyid: 6F71F525282841EEDAF851B42F59B5F99B1BE0B4
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - zsh
+  - zsh-autosuggestions
+  - zsh-syntax-highlighting
+  - git
+  - curl
+  - wget
+  - ca-certificates
+  - openssh-server
+  - build-essential
+  - unzip
+  - less
+  - python3
+  - python3-venv
+  - python3-pip
+  - nodejs
+  - neovim
+  - jq
+  - fd-find
+  - ripgrep
+  - fzf
+  - zoxide
+  - eza
+  - bat
+
+write_files:
+  # --- proxy + shell env ----------------------------------------------------
+  # NO_PROXY covers the whole host IP, so the host-side services that live there
+  # — searxng (:@@SEARXNG_PORT@@) and the git daemon — are reached DIRECTLY and
+  # clients skip mitmproxy for them on their own. Keep it: without it those go
+  # through the allowlist, which does not (and should not) list @@HOST_IP@@.
+  #
+  # OPENAI_BASE_URL used to point at litellm on :4000. That service is gone
+  # (2026-09-11); API-key providers are now reached at their REAL urls through
+  # the proxy, which swaps @@KEY_SENTINEL@@ for the real key on the host side.
+  # Good riddance to the trap where a global OPENAI_BASE_URL misrouted Codex's
+  # OAuth into litellm and had to be unset by hand for a Codex session.
+  - path: /etc/environment
+    content: |
+      HTTP_PROXY=http://@@HOST_IP@@:@@PROXY_PORT@@
+      HTTPS_PROXY=http://@@HOST_IP@@:@@PROXY_PORT@@
+      http_proxy=http://@@HOST_IP@@:@@PROXY_PORT@@
+      https_proxy=http://@@HOST_IP@@:@@PROXY_PORT@@
+      NO_PROXY=localhost,127.0.0.1,@@HOST_IP@@
+      no_proxy=localhost,127.0.0.1,@@HOST_IP@@
+      SEARXNG_URL=http://@@HOST_IP@@:@@SEARXNG_PORT@@
+      # The sentinel (not a secret — the proxy swaps it for the real key).
+      # ANTHROPIC/OPENAI/GEMINI are deliberately absent: those CLIs prefer an
+      # API key over a subscription session, so setting one globally moves you
+      # onto metered billing. Export it per-command instead.
+      OPENROUTER_API_KEY=@@KEY_SENTINEL@@
+      IN_AGENT_VM=1
+      COLORTERM=truecolor
+      EDITOR=nvim
+      VISUAL=nvim
+      STARSHIP_CONFIG=/etc/starship.toml
+      # Runtimes that ship their own trust store and ignore the system one.
+      NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+      PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+      SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+      CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+  # --- static address on the host bridge ------------------------------------
+  # net-up.sh creates the bridge at @@HOST_IP@@/24 and runs NO DHCP server, so
+  # the guest must be static. Match by name glob, not a fixed `enp0s3`: the
+  # virtio-net name shifts with PCI slot, and adding a VFIO GPU changes the
+  # topology — pinning it stalled boot when it became enp1s0.
+  #
+  # No default route and no nameservers, deliberately. Everything off-subnet is
+  # dropped by the agent_vm forward chain anyway, and the proxy does all name
+  # resolution. Configuring an unreachable resolver would only convert instant,
+  # legible failures into slow ones.
+  #
+  # Written to /etc/netplan directly, but NOT applied here — the DHCP config
+  # cloud-init generated for the build boot must survive until poweroff, or apt
+  # loses the network mid-provision. runcmd removes it at the very end.
+  - path: /etc/netplan/60-katastrophe.yaml
+    permissions: "0600"
+    content: |
+      network:
+        version: 2
+        ethernets:
+          agent0:
+            match:
+              name: "en*"
+            dhcp4: false
+            dhcp6: false
+            addresses: [@@VM_IP@@/@@PREFIX@@]
+
+  # --- system zshrc ---------------------------------------------------------
+  # Mirrors the old programs.zsh.interactiveShellInit. The order is
+  # load-bearing: compinit -> fzf-tab -> fzf widgets -> zoxide -> autosuggestions
+  # -> syntax highlighting (must be dead last) -> starship.
+  - path: /etc/zsh/zshrc
+    content: |
+      bindkey -e
+      bindkey "^[[H"    beginning-of-line
+      bindkey "^[[F"    end-of-line
+      bindkey "^[[3~"   delete-char
+      bindkey "^[[1;5C" forward-word
+      bindkey "^[[1;5D" backward-word
+
+      HISTSIZE=50000
+      SAVEHIST=50000
+      HISTFILE="$HOME/.zsh_history"
+      setopt HIST_IGNORE_DUPS HIST_IGNORE_SPACE SHARE_HISTORY INC_APPEND_HISTORY
+
+      export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+      export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+      export NODE_PATH="$HOME/.npm-global/lib/node_modules${NODE_PATH:+:$NODE_PATH}"
+
+      autoload -Uz compinit && compinit
+
+      [[ -r /usr/share/zsh-fzf-tab/fzf-tab.plugin.zsh ]] \
+        && source /usr/share/zsh-fzf-tab/fzf-tab.plugin.zsh
+
+      # `fzf --zsh` only exists from fzf 0.48; Ubuntu 24.04 ships 0.44, where
+      # the widgets are shipped as files instead.
+      if fzf --zsh >/dev/null 2>&1; then
+        source <(fzf --zsh)
+      else
+        [[ -r /usr/share/doc/fzf/examples/key-bindings.zsh ]] \
+          && source /usr/share/doc/fzf/examples/key-bindings.zsh
+        [[ -r /usr/share/doc/fzf/examples/completion.zsh ]] \
+          && source /usr/share/doc/fzf/examples/completion.zsh
+      fi
+
+      eval "$(zoxide init --cmd z zsh)"
+      source /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh
+      source /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+      eval "$(starship init zsh)"
+
+  - path: /etc/starship.toml
+    encoding: b64
+    content: @@B64_STARSHIP@@
+
+  - path: /etc/ssh/sshd_config.d/99-katastrophe.conf
+    content: |
+      PasswordAuthentication yes
+      PermitRootLogin no
+
+  # Serial console: getty defaults to TERM=linux, which mangles anything
+  # full-screen, and autologin matches the old services.getty.autologinUser.
+  # Still a poor host for TUIs — `kata vm --ssh` is the answer for nvim.
+  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/override.conf
+    content: |
+      [Service]
+      Environment=TERM=xterm-256color
+      Environment=COLORTERM=truecolor
+      ExecStart=
+      ExecStart=-/sbin/agetty -o '-p -- agent' --noclear --autologin agent --keep-baud 115200,57600,38400,9600 %I $TERM
+
+  # Installable on demand inside a warm base too: `sudo kata-install-cuda`,
+  # then re-bake with `kata vm --to cuda`. Baked in directly when build-base.sh
+  # is given --cuda.
+  - path: /usr/local/sbin/kata-install-cuda
+    permissions: "0755"
+    encoding: b64
+    content: @@B64_CUDA@@
+
+  # The shell toolbox. Run unconditionally by runcmd below (unlike CUDA, which
+  # is opt-in): an agent that does not know it has `rg` uses `grep -r`, so the
+  # tools are only worth having if they are always there. Also usable later as
+  # `sudo kata-install-tools --check` to verify the image against what
+  # ~/.agents/AGENTS.md promises.
+  - path: /usr/local/sbin/kata-install-tools
+    permissions: "0755"
+    encoding: b64
+    content: @@B64_TOOLS@@
+
+  # NOTE: nothing is written under /home/agent any more. That directory is a
+  # MOUNTPOINT at session time — the persistent agent home comes in over
+  # virtiofs (see the share block in runcmd), so anything baked here would be
+  # shadowed the moment the share mounts, and would silently diverge from the
+  # copy on the storage tree. The per-user dotfiles (.zshrc, .npmrc,
+  # .config/fastfetch) are seeded HOST-side instead, by `kata disk seed`, from
+  # the same guest/configs/ files this image builds from.
+
+runcmd:
+  # --- binary name shims ----------------------------------------------------
+  # Debian renames both to dodge package name clashes; the user zshrc (and
+  # muscle memory) expect the real names.
+  - [ln, -sf, /usr/bin/fdfind, /usr/local/bin/fd]
+  - [ln, -sf, /usr/bin/batcat, /usr/local/bin/bat]
+
+  # --- fzf-tab (packaged nowhere) -------------------------------------------
+  - [git, clone, --depth, "1", "https://github.com/Aloxaf/fzf-tab", /usr/share/zsh-fzf-tab]
+
+  # --- starship + uv + fastfetch --------------------------------------------
+  # Single static binaries with official installers, into /usr/local/bin so
+  # every user gets them. fastfetch is not in 24.04's archive (it lands in
+  # 24.10), so take the release .deb.
+  - curl -fsSL https://starship.rs/install.sh | sh -s -- --yes --bin-dir /usr/local/bin
+  - curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+  - curl -fsSL -o /tmp/fastfetch.deb "https://github.com/fastfetch-cli/fastfetch/releases/download/@@FASTFETCH_VER@@/fastfetch-linux-amd64.deb"
+  - [apt-get, install, -y, /tmp/fastfetch.deb]
+  - [rm, -f, /tmp/fastfetch.deb]
+
+  # The agent uid owns everything it touches in here and there is no multi-user
+  # threat model inside the guest, so git's ownership check is pure noise — it
+  # fires on every clone from a read-only host mount, where the host uid differs.
+  - [git, config, --system, safe.directory, "*"]
+
+  # --- NVIDIA driver + CUDA (only when build-base.sh got --cuda) ------------
+  # With VFIO the guest owns the physical card outright, so the in-guest driver
+  # version is independent of the host's. Adds ~3 GB; off by default.
+  # --- the shell toolbox ----------------------------------------------------
+  # MUST stay above the netplan/apt-proxy lines at the bottom of this list: from
+  # there on the guest expects the host bridge and the proxy, neither of which
+  # exists during a build. This needs the SLIRP NAT that is still live here —
+  # and being here is exactly why it costs no allowlist entries (cargo-binstall
+  # hits index.crates.io, `go install` hits proxy.golang.org; neither host is
+  # allowlisted, and neither needs to be).
+  - [/usr/local/sbin/kata-install-tools]
+
+  - @@CUDA_CMD@@
+
+  # --- virtiofs shares ------------------------------------------------------
+  # vm.sh exports one virtiofs tag per share: `workspace` (the persistent agent
+  # home) plus ro_N / rw_N for each --ro / --rw flag, numbered from 1 in the
+  # order given. NOTHING mounts them for us — this replaces the `fileSystems`
+  # block the NixOS image carried, and its absence is why a fresh Ubuntu guest
+  # boots with none of them.
+  #
+  # The `workspace` share mounts AT /home/agent, which is the whole persistence
+  # story: / is a throwaway overlay deleted at poweroff, so a home that lives on
+  # it loses ~/.claude, ~/.cache/huggingface and every checkout each session.
+  # Mounting the storage tree as the home makes all of that persist with no env
+  # vars and nothing baked into a base image — which is also why an OAuth login
+  # no longer has to be frozen into a warm base with --to.
+  #
+  # The tag is still called `workspace` on purpose: warm bases built before this
+  # change carry the old fstab line and would otherwise mount nothing at all.
+  # They mount it at /workspace instead (harmless, just not persistent) until
+  # they are rebuilt.
+  #
+  # Four of each matches the old image's bound. `nofail` is what makes a fixed
+  # table work against a variable number of shares: entries whose tag wasn't
+  # passed this session fail to mount and are skipped, instead of dropping the
+  # boot into emergency mode. Keep it on every line — and note that it also
+  # means a home share that fails to mount leaves you in the (empty) image
+  # directory rather than blocking the boot.
+  - |
+    {
+      echo 'workspace /home/agent virtiofs defaults,nofail 0 0'
+      for i in 1 2 3 4; do
+        mkdir -p "/mnt/ro_$i" "/mnt/rw_$i"
+        echo "ro_$i /mnt/ro_$i virtiofs ro,nofail 0 0"
+        echo "rw_$i /mnt/rw_$i virtiofs defaults,nofail 0 0"
+      done
+    } >> /etc/fstab
+
+  # --- drop the build-only apt repo ------------------------------------------
+  # nodesource exists purely so `packages:` above could install Node 22 (Ubuntu
+  # 24.04 ships 18.19). Node is installed by now, and deb.nodesource.com is NOT
+  # on the runtime allowlist — so leaving the source list behind means every
+  # `apt-get update` in the sandbox ends in a 403 and a "repository is no longer
+  # signed" error, and exits non-zero forever. That is a build artifact leaking
+  # into runtime, not the allowlist protecting anything: the package is already
+  # there. Removing the list is strictly better than allowlisting the host,
+  # which would widen the egress surface permanently for a repo needed once.
+  # To upgrade Node later: allowlist it deliberately, or re-bake.
+  - [rm, -f, /etc/apt/sources.list.d/nodesource.list, /etc/apt/sources.list.d/nodesource.sources]
+
+  # --- trim -----------------------------------------------------------------
+  # snapd and unattended-upgrades are both useless here (no snaps; an image that
+  # mutates itself behind your back defeats a pinned base) and both generate
+  # egress the allowlist would otherwise have to permit.
+  - [systemctl, disable, --now, unattended-upgrades.service]
+  - [apt-get, purge, -y, snapd, unattended-upgrades]
+  - [apt-get, autoremove, -y]
+  - [apt-get, clean]
+  - [systemctl, enable, ssh]
+
+  # Three daemons whose entire job is to reach a network this guest does not
+  # have, plus a crash reporter that wants to phone home. This is surface
+  # reduction, NOT a boot-time optimisation — see the cold-boot note below.
+  #
+  #   resolved   binds a stub resolver on 127.0.0.53:53. The guest must never
+  #              resolve anything: it hands `CONNECT host:443` to mitmproxy and
+  #              the HOST does the lookup. That is what makes the allowlist
+  #              meaningful — a name the guest cannot resolve is a destination
+  #              it cannot reach except through the gate. DNS is a favourite
+  #              exfil channel precisely because it reads as infrastructure
+  #              rather than as traffic, so an in-guest resolver is a liability
+  #              with no compensating use. Verified: with resolved masked,
+  #              `curl https://pypi.org/simple/` still returns 200.
+  #   timesyncd  wants NTP across a route that does not exist (no default route
+  #              is deliberate — see the netplan block).
+  #   apport     a crash reporter, in a VM whose crashes are disposable.
+  #   wait-online  blocks on a link becoming "routable", a condition we have
+  #              chosen never to satisfy.
+  #
+  # WAIT-ONLINE MUST BE MASKED, NOT DISABLED (found 2026-09-13, on base v3 —
+  # the first build where this block ran at all). `disable` removed the symlink
+  # in /etc and netplan's generator put an equivalent one back under /run on the
+  # next boot, so `systemctl is-enabled` reported `enabled-runtime` and the unit
+  # was the TOP entry in `systemd-analyze blame` (1.652s) on a guest where the
+  # trim was supposedly applied. Cause: systemd-networkd.service ships
+  # `Also=systemd-networkd-wait-online.service` in its [Install] section.
+  #
+  # The general rule, and the reason this is worth eleven lines: `disable` only
+  # REMOVES a symlink, so anything that regenerates units can undo it silently.
+  # `mask` ASSERTS a symlink to /dev/null in /etc, and /etc wins over /run in
+  # unit lookup — so it survives regeneration. Disable is a default you can
+  # lose; mask is a decision that holds. Prefer mask for anything you are
+  # turning off on purpose.
+  - [systemctl, disable, --now, systemd-timesyncd.service, apport.service]
+  - [systemctl, mask, systemd-resolved.service, systemd-networkd-wait-online.service]
+  # Masking resolved leaves /etc/resolv.conf a DANGLING symlink into /run, which
+  # works (glibc falls back to 127.0.0.1 and gets an instant refusal) but reads
+  # as breakage. Say it out loud instead.
+  - [rm, -f, /etc/resolv.conf]
+  - |
+    cat > /etc/resolv.conf <<'EOF'
+    # Deliberately empty. Name resolution is the proxy's job, on the host.
+    # systemd-resolved is masked; see the trim block in cloud-init user-data.
+    EOF
+
+  # `hostname: agent-vm` above without a matching /etc/hosts entry means EVERY
+  # sudo call opens with `sudo: unable to resolve host agent-vm: Temporary
+  # failure in name resolution`. Harmless, but it is a failing lookup on a hot
+  # path and it trains you to ignore sudo's stderr — which is where the real
+  # warnings show up.
+  - [sh, -c, "grep -q ' agent-vm' /etc/hosts || echo '127.0.1.1 agent-vm' >> /etc/hosts"]
+
+  # --- switch to the sandbox network (LAST — this drops the build network) ---
+  # Everything above needed plain NAT egress. From here on the guest is
+  # configured for the host bridge and the mitmproxy gate, which only exist at
+  # session time. Nothing after this line may touch the network.
+  - [rm, -f, /etc/netplan/50-cloud-init.yaml]
+  - |
+    cat > /etc/apt/apt.conf.d/99katastrophe-proxy <<'EOF'
+    Acquire::http::Proxy "http://@@HOST_IP@@:@@PROXY_PORT@@";
+    Acquire::https::Proxy "http://@@HOST_IP@@:@@PROXY_PORT@@";
+    EOF
+
+  # --- diagnostics, while the logs still exist -------------------------------
+  # cloud-init logs "cloud-config failed schema validation!" with no detail and
+  # points at `cloud-init schema --system`, whose output lives in the guest —
+  # which the `clean --logs` below is about to delete. So print it to the serial
+  # console now: build-base.sh captures that, and it's the only place the detail
+  # is ever visible. `|| true` because a schema complaint must not fail a build
+  # that otherwise provisioned correctly.
+  - [sh, -c, "cloud-init schema --system >/dev/console 2>&1 || true"]
+
+  # --- lock cloud-init out of every subsequent boot -------------------------
+  # The base is provisioned exactly once, here. Re-running cloud-init on each
+  # session would redo network config and, with no seed attached, burn a
+  # datasource-search timeout on every boot. `clean` first, then the flag, so
+  # clean cannot remove the flag.
+  - [cloud-init, clean, --logs]
+  - [touch, /etc/cloud/cloud-init.disabled]
+
+  # --- the completion marker build-base.sh greps for ------------------------
+  # Written straight to /dev/console as the very last runcmd. It must NOT come
+  # from `power_state.message`: cloud-init passes that to `shutdown`, which
+  # broadcasts via wall — and wall only reaches logged-in terminals, of which a
+  # headless serial boot has none. The message therefore never appeared, and
+  # every build was declared failed after provisioning perfectly. Keep the
+  # string in sync with build-base.sh.
+  - [sh, -c, "echo 'katastrophe base provisioned' > /dev/console"]
+
+power_state:
+  mode: poweroff
+  timeout: 30
+  condition: true
