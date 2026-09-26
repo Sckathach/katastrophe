@@ -1,27 +1,13 @@
 #!/usr/bin/env bash
-# git-serve.sh — git daemon on the bridge: the project interchange hub.
-#
-# Serves the bare repos under $SHARED_SRC_DIR (created by project.sh) so the
-# in-sandbox experience is plain `git pull` / `git push` instead of a
-# cp/bundle/chown dance. Runs as YOU, not root: it binds an unprivileged port
-# and must write repos you own — so a push from the sandbox lands as your uid
-# through git's own receive-pack, never as filesystem write access.
-#
-# The read/write split is per-repo git config, checked by git itself:
+# git-serve.sh — git daemon on the bridge (`kata git up|down|status`), serving
+# the bare repos under $SHARED_SRC_DIR. Runs as you: a sandbox push lands as
+# your uid through git's receive-pack, never as filesystem write access.
 #
 #   <name>.git         export-ok, receivepack unset  → guest can FETCH only
 #   <name>-agent.git   export-ok, daemon.receivepack → guest can fetch + PUSH
 #
-# `git daemon` disables receive-pack globally by default and allows per-repo
-# override, which is exactly this shape. No hook is involved.
-#
-# No auth on git:// — the controls are: bound to $HOST_IP (bridge only, never
-# 0.0.0.0), reachable only from $BRIDGE via the nft rules net-up.sh installs,
-# per-repo export opt-in (NO --export-all), and receivepack on the egress repo
-# only. The bridge's only peer is the sandbox, which is already the untrusted
-# party in the threat model.
-#
-# Subcommands: up | down | status
+# No auth on git://. The controls: bound to $HOST_IP only, reachable only from
+# the bridge (nft), per-repo export opt-in, receive-pack on the egress repo only.
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -33,14 +19,14 @@ die() {
   exit 1
 }
 
-# Pid of a *live* git daemon from the pidfile, or empty. Verifies the process is
-# actually ours before anything kills it (pidfiles go stale, pids get reused).
+# Pid of a live git daemon from the pidfile, or empty. Checks the cmdline too:
+# pidfiles go stale and pids get reused.
 daemon_pid() {
   local pid
   [[ -s "$GIT_DAEMON_PID" ]] || return 0
   pid="$(cat "$GIT_DAEMON_PID")"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-  kill -0 "$pid" 2>/dev/null || return 0
+  pid_alive "$pid" || return 0
   tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null | grep -q 'daemon' || return 0
   echo "$pid"
 }
@@ -57,8 +43,7 @@ cmd_up() {
   [[ -O "$SHARED_SRC_DIR" ]] ||
     die "you must own $SHARED_SRC_DIR (the daemon writes pushed objects as you)"
 
-  # git daemon cannot bind an address the host doesn't have. Without the bridge
-  # it would exit with a bare "Cannot bind to ..." — say why instead.
+  # Otherwise git daemon dies with a bare "Cannot bind".
   ip -o addr show to "${HOST_IP}/32" 2>/dev/null | grep -q . ||
     die "$HOST_IP is not on this host — bring the bridge up first: kata up"
 
@@ -68,16 +53,18 @@ cmd_up() {
     echo "[=] git daemon already running (pid $pid) on ${HOST_IP}:${GIT_PORT}"
     return 0
   fi
-  # A stale pidfile from a crashed daemon: safe to drop, we just proved no live
-  # daemon is behind it.
-  rm -f "$GIT_DAEMON_PID"
+  rm -f "$GIT_DAEMON_PID" # stale: no live daemon behind it
+
+  # Rules are inserted at `kata up` time; a port added to config since then is
+  # closed to the guest. Only checkable without a prompt if sudo is cached.
+  if sudo -n nft list chain inet agent_vm input >/dev/null 2>&1 &&
+    ! sudo -n nft list chain inet agent_vm input 2>/dev/null | grep -q "dport ${GIT_PORT}"; then
+    echo "[!] no nft accept for ${GIT_PORT}, the sandbox will not reach the daemon — fix: kata up"
+  fi
 
   mkdir -p "$GIT_RUN_DIR"
-  # --export-all is deliberately NOT passed: a repo is served only if it has a
-  # git-daemon-export-ok file, so a stray checkout under $SHARED_SRC_DIR is
-  # never exposed. --informative-errors tells the guest "repo not exported" /
-  # "service not enabled" instead of a uniform "access denied" — the failure
-  # mode we WANT the agent to be able to read, since these are not secrets.
+  # Never --export-all: only repos with git-daemon-export-ok are served.
+  # --informative-errors: "not exported" / "service not enabled" are not secrets.
   git daemon \
     --base-path="$SHARED_SRC_DIR" \
     --listen="$HOST_IP" \
@@ -107,19 +94,16 @@ cmd_down() {
   fi
   kill "$pid"
   for _ in $(seq 1 30); do
-    kill -0 "$pid" 2>/dev/null || break
+    pid_alive "$pid" || break
     sleep 0.1
   done
-  kill -0 "$pid" 2>/dev/null && die "git daemon (pid $pid) did not exit"
+  if pid_alive "$pid"; then die "git daemon (pid $pid) did not exit"; fi
   rm -f "$GIT_DAEMON_PID"
   echo "[-] git daemon stopped"
 }
 
 cmd_status() {
   local pid
-  # Which tree the repos come from is the storage mode, and the daemon serves
-  # exactly one of them — a `kata git up` on the local tree next to a
-  # `kata --usb project add` is two halves of a workflow that never meet.
   pid="$(daemon_pid)"
   if [[ -n "$pid" ]]; then
     echo "  pid       $pid ($GIT_DAEMON_PID)"
@@ -143,8 +127,7 @@ cmd_status() {
     fi
   done
 
-  # Best effort: the daemon logs to the journal as user $UID, which you can read
-  # for your own messages. Silent if the journal isn't readable here.
+  # Best effort: silent if the journal is not readable here.
   echo "  recent log"
   journalctl -t git-daemon -n 5 --no-pager 2>/dev/null | sed 's/^/    /' || true
 }
@@ -158,7 +141,7 @@ up) cmd_up "$@" ;;
 down) cmd_down "$@" ;;
 status) cmd_status "$@" ;;
 -h | --help | "")
-  echo "usage: git-serve {up|down|status}"
+  echo "usage: kata git {up|down|status}"
   exit 1
   ;;
 *) die "unknown subcommand: $sub" ;;

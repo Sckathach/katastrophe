@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
-# project.sh — git interchange between you and the agent (kills the chown dance).
+# project.sh — git interchange between you and the agent (`kata project`).
 #
-# Two bare repos per project, both YOURS, served read-only/read-write by the
-# git daemon on the bridge (scripts/git-serve.sh). Nothing is shared-writable;
-# only git objects cross, and objects are data, never executed.
+# Two bare repos per project, both yours, served by the git daemon on the bridge
+# (git-serve.sh). Nothing is shared-writable; only git objects cross.
 #
 #   you (real repo) --push--> src/<name>.git  ──fetch (ro)──▶ sandbox clone
 #                                                                  │ push
 #   you (real repo) <--fetch-- src/<name>-agent.git ◀──────────────'
 #
-# The read/write split is enforced by git itself: only <name>-agent.git has
-# daemon.receivepack=true, so a push to <name>.git is refused by the daemon
-# ("service not enabled"). That is the core invariant — no hook involved.
-#
-# Run as YOURSELF (not root). The agent-worktree steps (only needed for the
-# filesystem-sharing GPU/container profile) go through `sudo -u $AGENT_USER`
-# and are SKIPPED with a notice when there's no agent user or agent-home.
+# Only <name>-agent.git has daemon.receivepack=true, so git itself refuses a push
+# to <name>.git. Runs as you; needs no privilege.
 #
 # Subcommands:
 #   add  <host-repo> [name]   register a repo: create both bare repos, wire
@@ -40,12 +34,6 @@ die() {
 ingress_of() { echo "${SHARED_SRC_DIR}/${1}.git"; }
 egress_of() { echo "${SHARED_SRC_DIR}/${1}-agent.git"; }
 
-# Run a command as the agent uid from a neutral cwd. `sudo -u agent` inherits
-# the caller's cwd; if that's under your 0700 home the agent can't stat it and
-# git dies opaquely (same foot-gun as the workspace guard). /tmp is 1777, so the
-# agent can always traverse it. The subshell keeps our own cwd unchanged.
-as_agent() { (cd /tmp && sudo -u "$AGENT_USER" "$@"); }
-
 # Idempotent `git remote set-url-or-add` in the repo at $1.
 ensure_remote() {
   local repo="$1" name="$2" url="$3"
@@ -57,11 +45,8 @@ require_tools() {
   command -v git >/dev/null || die "install git"
 }
 
-# shared-storage must exist, be yours, and be outside your 0700 home (so the
-# agent uid can traverse it). It's a §2 subvolume; any you-owned 755 dir works.
+# Must exist, be yours, and sit outside your 0700 home.
 preflight_shared() {
-  # Refuse an unmounted mountpoint before anything writes to it (config.sh):
-  # as root that lands on the root filesystem and vanishes under the next mount.
   require_storage "$SHARED_STORAGE_DIR"
   [[ -d "$SHARED_STORAGE_DIR" ]] ||
     die "shared-storage not found: $SHARED_STORAGE_DIR (set up the §2 storage, or export SHARED_STORAGE_DIR)"
@@ -70,23 +55,8 @@ preflight_shared() {
   mkdir -p "$SHARED_SRC_DIR" || die "cannot create $SHARED_SRC_DIR"
 }
 
-# The agent worktree is only useful on the filesystem-sharing profile (GPU
-# container, now deleted). The VM clones over git:// and needs none of this — so its
-# absence is a skip with a notice, never a failure.
-agent_available() {
-  command -v sudo >/dev/null 2>&1 || return 1
-  id -u "$AGENT_USER" >/dev/null 2>&1 || return 1
-  [[ -d "$MOUNT_HOME" ]] || return 1
-}
-
-skip_agent_notice() {
-  echo "[=] no agent worktree (need user '$AGENT_USER' + $MOUNT_HOME) — skipping."
-  echo "    Not needed: the VM clones over git://."
-}
-
-# True iff the egress repo ($2) holds a branch tip the ingress ($1) has never
-# seen — i.e. the sandbox actually pushed work. Robust to the ingress moving on
-# afterwards, which a plain ref comparison is not.
+# True iff egress ($2) holds a branch tip ingress ($1) has never seen: the
+# sandbox pushed work. Unlike a ref comparison, robust to ingress moving on.
 egress_has_new() {
   local sha ref
   while read -r sha ref; do
@@ -121,15 +91,13 @@ cmd_add() {
   echo "[*] src ${SHARED_SRC_DIR}"
   preflight_shared
 
-  local ingress egress worktree
+  local ingress egress
   ingress="$(ingress_of "$name")"
   egress="$(egress_of "$name")"
-  worktree="${AGENT_WORK_DIR}/${name}"
 
   [[ -e "$ingress" ]] && die "ingress already exists: $ingress (use 'project push $name')"
   [[ -e "$egress" ]] && die "egress already exists: $egress"
-  # Pre-daemon layout: a bare repo with no .git suffix and no export-ok. It is
-  # not served, and re-adding under it would be silently ignored. Say so.
+  # Old layout (no .git suffix): not served, and silently shadowing a re-add.
   [[ -e "${SHARED_SRC_DIR}/${name}" ]] &&
     die "old-layout ingress at ${SHARED_SRC_DIR}/${name} — the daemon serves <name>.git; move or delete it first"
 
@@ -137,44 +105,20 @@ cmd_add() {
   git clone --quiet --bare "$src" "$ingress"
   touch "${ingress}/git-daemon-export-ok"
 
-  # Full object copy, not --shared: alternates would couple the two repos' gc
-  # lifetimes (a gc in ingress could prune objects the egress repo still needs).
-  # These repos are small; prefer the boring thing.
+  # Full copy, not --shared: alternates would let an ingress gc prune egress objects.
   echo "[*] egress (sandbox → you, push target) → $egress"
   git clone --quiet --bare "$ingress" "$egress"
   touch "${egress}/git-daemon-export-ok"
   git -C "$egress" config daemon.receivepack true
   git -C "$egress" config receive.maxInputSize "$GIT_MAX_INPUT"
-  # Append-only. Your own branches are never at risk (the agent pushes into a
-  # SEPARATE repo, and `project pull` only writes refs/remotes/agent/*), so this
-  # isn't branch protection — it protects the review trail: without it the agent
-  # can rewrite or drop history you have already fetched out and looked at,
-  # making a second `project pull` disagree with the first for no visible reason.
+  # Append-only, to protect the review trail: the agent cannot rewrite or drop
+  # history you already fetched and looked at.
   git -C "$egress" config receive.denyDeletes true
   git -C "$egress" config receive.denyNonFastForwards true
 
   echo "[*] wiring remotes in $src (sandbox→ingress, agent→egress)"
   ensure_remote "$src" sandbox "$ingress"
   ensure_remote "$src" agent "$egress"
-
-  if agent_available; then
-    if as_agent mkdir -p "$AGENT_WORK_DIR" 2>/dev/null; then
-      if as_agent test -e "$worktree"; then
-        echo "[=] agent worktree already exists: $worktree — left alone"
-      else
-        echo "[*] cloning into the agent's worktree → $worktree"
-        as_agent git clone --quiet "$ingress" "$worktree"
-        # The agent cannot write $SHARED_SRC_DIR (yours), so its push has to go
-        # through the daemon even on the filesystem-sharing profile.
-        as_agent git -C "$worktree" remote set-url --push origin \
-          "git://${HOST_IP}:${GIT_PORT}/${name}-agent.git"
-      fi
-    else
-      echo "[!] agent cannot write $AGENT_WORK_DIR (is $MOUNT_HOME agent-owned?) — skipping worktree"
-    fi
-  else
-    skip_agent_notice
-  fi
 
   echo "[ok] '$name' registered."
   print_guest_commands "$name"
@@ -184,10 +128,9 @@ cmd_add() {
 cmd_push() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: project push <name>"
-  local repo ingress egress branch worktree
+  local repo ingress egress branch
   ingress="$(ingress_of "$name")"
   egress="$(egress_of "$name")"
-  worktree="${AGENT_WORK_DIR}/${name}"
   repo="$(git rev-parse --show-toplevel 2>/dev/null)" ||
     die "run this inside your project checkout (cwd is not a git repo)"
   [[ -d "$ingress" ]] || die "no ingress for '$name' — run 'project add' first"
@@ -199,24 +142,15 @@ cmd_push() {
   echo "[*] pushing $branch → ingress ($name)"
   git -C "$repo" push --quiet sandbox "$branch"
 
-  # Fetch (not merge) into the agent worktree if there is one: safe to run while
-  # a session is live (refs only), so we never clobber the agent's working tree.
-  if agent_available && as_agent test -d "$worktree"; then
-    echo "[*] fetching ingress into the agent worktree"
-    as_agent git -C "$worktree" fetch --quiet origin
-    echo "[ok] agent can now: git -C $worktree merge origin/$branch"
-  else
-    echo "[ok] in the sandbox: git pull  (origin = git://${HOST_IP}:${GIT_PORT}/${name}.git)"
-  fi
+  echo "[ok] in the sandbox: git pull  (origin = git://${HOST_IP}:${GIT_PORT}/${name}.git)"
 }
 
 cmd_pull() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: project pull <name>"
-  local repo ingress egress worktree
+  local repo ingress egress
   ingress="$(ingress_of "$name")"
   egress="$(egress_of "$name")"
-  worktree="${AGENT_WORK_DIR}/${name}"
   repo="$(git rev-parse --show-toplevel 2>/dev/null)" ||
     die "run this inside your project checkout (cwd is not a git repo)"
   [[ -d "$egress" ]] || die "no egress repo for '$name' at $egress — run 'project add' first"
@@ -225,27 +159,17 @@ cmd_pull() {
   echo "[*] fetching egress repo → refs/remotes/agent/*"
   git -C "$repo" fetch --quiet --prune agent '+refs/heads/*:refs/remotes/agent/*'
 
-  # The egress repo starts as a bare clone of the ingress (so the agent's first
-  # push is an incremental delta, not a full re-upload that receive.maxInputSize
-  # would reject) — so "empty" is never the idle state, and we can't just look
-  # for refs. "The agent pushed something" == the egress holds a commit the
-  # ingress doesn't. Say it explicitly: otherwise "nothing pushed yet" and "pull
-  # is broken" look identical.
+  # Egress starts as a clone of ingress, so it is never empty: "pushed" means it
+  # holds a commit ingress lacks. Said out loud, or "nothing yet" looks broken.
   if ! egress_has_new "$ingress" "$egress"; then
     echo "[=] no commits in the egress repo that the ingress lacks — nothing pushed yet."
     echo "    In the sandbox: git push origin <branch>  (pushurl = ${name}-agent.git)"
-    if agent_available && as_agent test -d "$worktree"; then
-      echo "    (an agent worktree exists at $worktree — it must push too, not just commit)"
-    fi
     return 0
   fi
   echo "[ok] review before merging (never run agent artifacts): git -C $repo log --oneline agent/<branch>"
 }
 
 cmd_list() {
-  # Projects live on whichever tree the storage mode picked, and `kata git up`
-  # serves exactly one of them. Print it, so a `project add` that landed on the
-  # local tree can't look like a project that vanished.
   echo "[*] src ${SHARED_SRC_DIR}"
   [[ -d "$SHARED_SRC_DIR" ]] || {
     echo "no projects (no $SHARED_SRC_DIR yet)"
@@ -270,7 +194,7 @@ cmd_list() {
   done
 }
 
-[[ $EUID -ne 0 ]] || die "run as yourself, not root (agent steps self-sudo)"
+[[ $EUID -ne 0 ]] || die "run as yourself, not root"
 require_tools
 
 sub="${1:-}"

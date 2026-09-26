@@ -1,47 +1,21 @@
 #!/usr/bin/env bash
 # gpu-mode.sh — decide which side owns the dGPU across a reboot.
 #
-#   gpu-mode.sh status    what the host is set to, and what it's actually doing
-#   gpu-mode.sh host      the host keeps the GPU (nvidia driver) — the default
-#   gpu-mode.sh sandbox   the GPU is reserved for VFIO, so `kata vm --gpu` works
-#   gpu-mode.sh vbios     fingerprint the card's option ROM, or compare to the
-#                         recorded one (threat: gpu-firmware-persistence)
+#   kata gpu-mode status    what the host is set to, and what it is doing
+#   kata gpu-mode host      the host keeps the GPU (nvidia driver) — the default
+#   kata gpu-mode sandbox   the GPU is reserved for VFIO, so `kata vm --gpu` works
+#   kata gpu-mode vbios     fingerprint the card's option ROM, or compare to the
+#                           recorded one (threat: gpu-firmware-persistence)
 #
-# ---------------------------------------------------------------------------
-# Why this needs a reboot, and why that is not laziness
-# ---------------------------------------------------------------------------
-# The obvious design is to unbind the card from `nvidia` at session start and
-# rebind afterwards, no reboot. That does not work here, and it is worth writing
-# down why so nobody re-attempts it:
 #
-#   $ lsof /dev/dri/card1
-#   systemd (pid 1), systemd-logind, Hyprland, Xwayland
+# A reboot, not a live unbind: systemd-logind holds a DRM fd on every card on the
+# seat and will not let go, so the only way to free the dGPU is for its DRM node
+# never to exist — a modprobe/initramfs decision. The panel is on the iGPU
+# (muxless Optimus), so sandbox mode costs host CUDA, not the display.
 #
-# systemd-logind holds a DRM fd on every card on the seat, for seat management —
-# it grabs the node as soon as it exists, and it is not going to let go for us.
-# Pinning the compositor to the iGPU (AQ_DRM_DEVICES) would drop Hyprland and
-# Xwayland, but not logind or pid 1. The only way to free the device is for the
-# DRM node never to be created, i.e. for `nvidia_drm` not to bind it at boot.
-# That is a modprobe/initramfs decision, so it is a reboot.
-#
-# The saving grace is that this machine's panel is on the Intel iGPU (the
-# NVIDIA connectors are all disconnected — muxless Optimus), so reserving the
-# dGPU for VFIO costs you no display, only host CUDA.
-#
-# ---------------------------------------------------------------------------
-# What it writes
-# ---------------------------------------------------------------------------
-#   $VFIO_MODPROBE_CONF     vfio-pci claims the IDs; nvidia* blacklisted
-#   $VFIO_MKINITCPIO_CONF   vfio-pci into the initramfs, so it wins the race
-#
-# Both are DROP-IN files, and this script never edits mkinitcpio.conf itself.
-# A botched in-place edit of that file is an unbootable machine; a drop-in that
-# goes wrong is one `rm` away from fixed (and `gpu-mode.sh host` is that rm).
-#
-# It does NOT touch the kernel command line, because it does not need to: the
-# IOMMU is already active on this host (Intel VT-d defaults on with a sane DMAR
-# table) and interrupt remapping is enabled, which is what VFIO actually
-# requires. Nothing here needs a bootloader edit.
+# Writes two drop-ins, never edits mkinitcpio.conf ($VFIO_MODPROBE_CONF,
+# $VFIO_MKINITCPIO_CONF); `host` is the rm. No kernel cmdline change: VT-d and
+# interrupt remapping are already on here.
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -51,9 +25,7 @@ source "${HERE}/../config.sh"
 ACTION="${1:-status}"
 
 usage() {
-  # The action list is lines 4..N of this file, terminated by the blank comment
-  # line. Matched rather than hardcoded as '3,6p': that range silently truncated
-  # the help the first time an action was added below it.
+  # The action list in the header, up to the first bare `#` line.
   sed -n '4,/^#$/p' "$0" | sed 's/^# \?//;/^$/d'
   exit 1
 }
@@ -119,20 +91,18 @@ cmd_status() {
     echo "=> configured for sandbox but NOT yet in effect — reboot to apply."
   else
     echo "=> host owns the GPU. 'kata vm --gpu' will refuse."
-    echo "   To hand it to the sandbox: sudo $0 sandbox && sudo reboot"
+    echo "   To hand it to the sandbox: kata gpu-mode sandbox && sudo reboot"
   fi
 }
 
 cmd_sandbox() {
   [[ $EUID -eq 0 ]] || {
-    echo "run as root (sudo $0 sandbox)"
+    echo "run as root (kata gpu-mode sandbox)"
     exit 1
   }
 
-  # Refuse if the dGPU is currently driving a connected display. On this laptop
-  # it is not (muxless Optimus; the panel is on i915), but that is a property of
-  # the machine's MUX setting, which is changeable in firmware — so check rather
-  # than assume. Taking the GPU away from a live display leaves a black screen.
+  # The MUX is a firmware setting, so check rather than assume: taking the GPU
+  # from a connected display blacks it out.
   local sysfs_dev="/sys/bus/pci/devices/${ADDR}/drm"
   if [[ -d "$sysfs_dev" ]]; then
     local card conn
@@ -177,9 +147,7 @@ EOF
   chmod 0644 "$VFIO_MODPROBE_CONF"
   echo "[+] wrote $VFIO_MODPROBE_CONF"
 
-  # vfio-pci must be in the initramfs: by the time the real root is mounted the
-  # PCI devices have already been probed, and whichever driver got there first
-  # owns them.
+  # In the initramfs, or another driver probes the card first and owns it.
   mkdir -p "$(dirname "$VFIO_MKINITCPIO_CONF")"
   cat >"$VFIO_MKINITCPIO_CONF" <<'EOF'
 # Written by katastrophe scripts/gpu-mode.sh — do not edit by hand.
@@ -201,17 +169,17 @@ EOF
 After the reboot:
     kata gpu-mode status                     # every device should say vfio-pci
     kata up
-    kata vm --workspace DIR --gpu
+    kata vm --ssh --gpu
 
 While in this mode the HOST has no CUDA — nvidia-smi will report no devices,
 and anything on the host that wants the GPU will fail. Your display is
-unaffected (it is on the iGPU). To take it back:  sudo $0 host && sudo reboot
+unaffected (it is on the iGPU). To take it back:  kata gpu-mode host && sudo reboot
 EOF
 }
 
 cmd_host() {
   [[ $EUID -eq 0 ]] || {
-    echo "run as root (sudo $0 host)"
+    echo "run as root (kata gpu-mode host)"
     exit 1
   }
   local changed=0
@@ -239,25 +207,12 @@ EOF
 }
 
 # --- vbios: is the card's firmware still the one we started with? ----------
-# threat: gpu-firmware-persistence. Under --gpu the guest drives the real card,
-# so the open question is whether it can write the card's FLASH — which would
-# survive `gpu-mode host` and the reboot, after which the HOST driver binds a
-# card an untrusted guest modified. The PCI reset at reboot clears device state;
-# it does not clear flash.
+# threat: gpu-firmware-persistence. The guest drives the real card; if it can
+# write the card's flash, that survives the reboot back to host mode. This does
+# not answer "can it?" — it makes "did it?" answerable: record, then compare.
 #
-# This does NOT answer that question — answering it means establishing whether
-# signature enforcement covers every writable region the guest can reach, and
-# that is research, not a script. What it does is the operationally useful half:
-# record a fingerprint now, compare it later. "Can it?" stays open; "did it?"
-# becomes answerable, which is the difference between an accepted risk and an
-# unmonitored one.
-#
-# Caveats, stated because a firmware check that over-claims is worse than none:
-#   - This reads the PCI ROM BAR (the option ROM the card exposes). That is not
-#     the whole of the card's writable firmware — GSP images and any region the
-#     driver flashes by MMIO are NOT covered. A match here is not a clean bill.
-#   - The ROM BAR is only readable while nothing else is driving the card, so
-#     this refuses while a session is up.
+# Does not over-claim: this is the PCI ROM BAR only, not GSP or anything flashed
+# over MMIO, so a match is not a clean bill. Unreadable while a session runs.
 VBIOS_HASH_FILE="${VBIOS_HASH_FILE:-${VM_IMAGES_DIR}/gpu-vbios.sha256}"
 
 cmd_vbios() {
@@ -277,21 +232,13 @@ cmd_vbios() {
     echo "vbios: no ROM BAR exposed at ${rom} — cannot fingerprint this card."
     exit 1
   }
-  # `|| cur=""` is load-bearing, and its absence is why the first version of
-  # this printed NOTHING and exited non-zero. This script runs under
-  # `set -euo pipefail`; the ROM BAR returns EIO while the card is on vfio-pci,
-  # so `dd` fails, `pipefail` fails the whole pipeline, and under `set -e` a
-  # failed command substitution in an assignment kills the script right there —
-  # before any of the diagnostics below get a chance to explain themselves.
-  # Same family as the bare `[[ … ]] &&` trap documented at the top of lib.sh:
-  # under `set -e`, the silent death is always the failure mode.
+  # `|| cur=""`: on vfio-pci the ROM BAR returns EIO, and under set -e +
+  # pipefail the failed substitution would kill the script before it explains.
   echo 1 >"$rom" 2>/dev/null || true
   cur="$(dd if="$rom" bs=64k 2>/dev/null | sha256sum | awk '{print $1}')" || cur=""
   echo 0 >"$rom" 2>/dev/null || true
 
-  # An unreadable ROM hashes as the empty stream. Reporting that as a stable
-  # fingerprint would be the over-claiming check this repo keeps warning about:
-  # it would match itself forever and prove nothing.
+  # An unreadable ROM hashes as the empty stream, which would match forever.
   local empty
   empty="$(printf '' | sha256sum | awk '{print $1}')"
   if [[ -z "$cur" || "$cur" == "$empty" ]]; then
